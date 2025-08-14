@@ -305,19 +305,22 @@ class NENNClassifier(nn.Module):
 
 
 # -------------- Loaders ------------------
-def make_loaders(expr_df, labels_s, edge_index, edge_attr, batch_size=16, train_per=0.8, test_per=0.1, seed=420, stratify=True):
-    ds = ExpressionGraphDataset(expr_df, labels_s, edge_index, edge_attr)
+def make_loaders(expr_df, labels_s, edge_index, edge_attr,
+                 batch_size=16, train_per=0.8, test_per=0.1, seed=420,
+                 stratify=True):
+    # --- align labels and prepare y for splitting (same as dataset will see) ---
+    labels_s = labels_s.loc[expr_df.index]
+    y_all = LabelEncoder().fit_transform(labels_s.values)
 
-    S = len(ds)
+    S = len(expr_df)
     idx = np.arange(S)
 
     if stratify:
         from sklearn.model_selection import StratifiedShuffleSplit
-        y = ds.y.numpy()
         sss = StratifiedShuffleSplit(n_splits=1, test_size=(1 - train_per), random_state=seed)
-        train_idx, temp_idx = next(sss.split(idx, y))
-        # split temp into val/test stratified by the remaining ratio
-        y_temp = y[temp_idx]
+        train_idx, temp_idx = next(sss.split(idx, y_all))
+
+        y_temp = y_all[temp_idx]
         from sklearn.model_selection import StratifiedShuffleSplit as SSS2
         ratio_test = test_per / (1 - train_per)
         sss2 = SSS2(n_splits=1, test_size=ratio_test, random_state=seed)
@@ -330,12 +333,26 @@ def make_loaders(expr_df, labels_s, edge_index, edge_attr, batch_size=16, train_
         train_end = int(train_per*S); test_end = train_end + int(test_per*S)
         train_idx, test_idx, val_idx = idx[:train_end], idx[train_end:test_end], idx[test_end:]
 
-    subset = torch.utils.data.Subset
-    train_ds, val_ds, test_ds = subset(ds, train_idx), subset(ds, val_idx), subset(ds, test_idx)
+    # --- Z-score with TRAIN-ONLY stats (per gene/column) ---
+    mu = expr_df.iloc[train_idx].mean(axis=0)
+    sigma = expr_df.iloc[train_idx].std(axis=0).replace(0, 1.0)
+    expr_df_z = (expr_df - mu) / sigma
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, pin_memory=True)
+    # --- build dataset and subset loaders (uses standardized frame) ---
+    ds = ExpressionGraphDataset(expr_df_z, labels_s, edge_index, edge_attr)
+
+    subset = torch.utils.data.Subset
+    train_ds = subset(ds, train_idx)
+    val_ds   = subset(ds, val_idx)
+    test_ds  = subset(ds, test_idx)
+
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=2, pin_memory=True)
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
     test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
+
+    # (Optional) keep mu/sigma if you later need to standardize new data consistently.
+    # You could return them if desired.
+
     return train_loader, val_loader, test_loader, ds
 
 # -------------- Logging + Train --------------------
@@ -350,8 +367,11 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
                  log_csv="training_log.csv", plot_png="training_curves.png", log_every=10,
                  class_weights=None, use_amp=False):
     amp_enabled = (device.type == "cuda") and use_amp
-    crit = nn.CrossEntropyLoss(weight=(class_weights.to(device) if class_weights is not None else None))
-    opt  = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    crit  = nn.CrossEntropyLoss(weight=(class_weights.to(device) if class_weights is not None else None))
+    opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, mode="min", factor=0.5, patience=5, verbose=True, min_lr=1e-6
+    )
     scaler = GradScaler(enabled=amp_enabled)
 
     hist = History()
@@ -360,12 +380,13 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
         torch.backends.cudnn.benchmark = True
 
     print(f"Device: {device}, torch.cuda.is_available()={torch.cuda.is_available()}")
-    
+
     for epoch in range(1, epochs+1):
         model.train()
         total = 0.0
-        pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch:03d}", leave=False)
-        avg_dt, avg_fw, avg_bw = 0.0, 0.0, 0.0
+        pbar = tqdm(enumerate(train_loader), total=len(train_loader),
+                    desc=f"Epoch {epoch:03d}", leave=False)
+        avg_dt = avg_fw = avg_bw = 0.0
 
         t0_epoch = perf_counter()
         for i, batch in pbar:
@@ -400,7 +421,7 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
                     "loss": f"{(total/((i+1)*batch.num_graphs)):.3f}"
                 })
 
-        # validation
+        # ----- validation -----
         model.eval()
         with torch.no_grad():
             vloss = 0.0; correct = 0; total_g = 0
@@ -419,8 +440,12 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
         val_acc    = correct / max(1, total_g)
         epoch_time = perf_counter() - t0_epoch
 
-        print(f"Epoch {epoch:03d} | {epoch_time:.1f}s | train_loss={train_loss:.4f} | "
-              f"val_loss={val_loss:.4f} | val_acc={val_acc:.3f}")
+        # step the scheduler on validation loss
+        sched.step(val_loss)
+        curr_lr = opt.param_groups[0]["lr"]
+
+        print(f"Epoch {epoch:03d} | {epoch_time:.1f}s | lr={curr_lr:.2e} | "
+              f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc:.3f}")
 
         hist.epoch.append(epoch); hist.train_loss.append(train_loss)
         hist.val_loss.append(val_loss); hist.val_acc.append(val_acc)
@@ -436,7 +461,6 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
     plt.savefig(plot_png, bbox_inches="tight", dpi=150); plt.close()
     print(f"Saved training log to {log_csv} and loss curves to {plot_png}")
     return hist
-
 
 # -------------- Main ---------------------
 if __name__ == "__main__":
@@ -470,6 +494,32 @@ if __name__ == "__main__":
         expr_df, labels_s, edge_index, edge_attr, batch_size=16, stratify=True
     )
 
+    # ---- Z-score sanity checks (train stats should be ~0 mean, ~1 std) ----
+    train_idx = np.array(train_loader.dataset.indices)
+    val_idx   = np.array(val_loader.dataset.indices)
+    test_idx  = np.array(test_loader.dataset.indices)
+
+    X = ds.X.numpy()  # standardized features for ALL samples, shape [S, N]
+
+    # IMPORTANT: use ddof=1 to match pandas std() used during standardization
+    mu_tr = X[train_idx].mean(axis=0)
+    sd_tr = X[train_idx].std(axis=0, ddof=1)
+
+    print(f"[z-score check] train | mean(|mu|)={np.mean(np.abs(mu_tr)):.3e} (≈0), "
+        f"avg(sd)={np.mean(sd_tr):.3f}, min(sd)={sd_tr.min():.3f}, max(sd)={sd_tr.max():.3f} (≈1)")
+
+    # These don't have to be ~0; they show how val/test are centered *by train stats*
+    mu_val = X[val_idx].mean(axis=0)
+    mu_tst = X[test_idx].mean(axis=0)
+    print(f"[z-score check] val   | mean(|mu|)={np.mean(np.abs(mu_val)):.3e}")
+    print(f"[z-score check] test  | mean(|mu|)={np.mean(np.abs(mu_tst)):.3e}")
+
+    # Quick NaN/Inf guard
+    bad = ~np.isfinite(X)
+    if bad.any():
+        i = np.argwhere(bad)
+        print(f"[z-score check] WARNING: found {bad.sum()} non-finite entries, first at {tuple(i[0])}")
+
     # Model
     in_node_dim = 1
     in_edge_dim = edge_attr.size(1)  # 1536
@@ -487,7 +537,7 @@ if __name__ == "__main__":
     print(f"[Embeddings BEFORE] node={node_emb_before.shape}, edge={edge_emb_before.shape}, graph={graph_emb_before.shape}")
 
     hist = run_training(train_loader, val_loader, model, device,
-                        epochs=100, lr=1e-3, weight_decay=1e-4,
+                        epochs=200, lr=1e-3, weight_decay=1e-4,
                         class_weights=train_weights, use_amp=True)
 
     stats = eval_on_loader(test_loader, model, device)
