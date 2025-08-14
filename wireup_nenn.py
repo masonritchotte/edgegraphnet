@@ -305,7 +305,7 @@ class NENNClassifier(nn.Module):
 
 
 # -------------- Loaders ------------------
-def make_loaders(expr_df, labels_s, edge_index, edge_attr, batch_size=32, train_per=0.8, test_per=0.1, seed=420, stratify=True):
+def make_loaders(expr_df, labels_s, edge_index, edge_attr, batch_size=16, train_per=0.8, test_per=0.1, seed=420, stratify=True):
     ds = ExpressionGraphDataset(expr_df, labels_s, edge_index, edge_attr)
 
     S = len(ds)
@@ -406,7 +406,7 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
             vloss = 0.0; correct = 0; total_g = 0
             for batch in val_loader:
                 batch = batch.to(device, non_blocking=True)
-                with autocast(enabled=scaler.is_enabled()):
+                with torch_autocast(device_type=device.type, enabled=amp_enabled):
                     logits = model(batch)
                     loss = crit(logits, batch.y)
                 vloss += loss.item() * batch.num_graphs
@@ -487,7 +487,7 @@ if __name__ == "__main__":
     print(f"[Embeddings BEFORE] node={node_emb_before.shape}, edge={edge_emb_before.shape}, graph={graph_emb_before.shape}")
 
     hist = run_training(train_loader, val_loader, model, device,
-                        epochs=5, lr=1e-3, weight_decay=1e-4,
+                        epochs=100, lr=1e-3, weight_decay=1e-4,
                         class_weights=train_weights, use_amp=True)
 
     stats = eval_on_loader(test_loader, model, device)
