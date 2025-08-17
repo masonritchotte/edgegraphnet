@@ -199,6 +199,57 @@ def graph_map(model, ds, device, n_components=2, out_path=None, seed=42):
         plt.savefig(out_path or "graph_embeddings_3d.png", dpi=150); plt.close()
     else:
         raise ValueError("n_components must be 2 or 3")
+    
+# --- Macro AUC Curve ---
+@torch.no_grad()
+def collect_probs(loader, model, device):
+    """Return (y_true [S], y_proba [S,C]) for a loader."""
+    import numpy as np, torch
+    model.eval()
+    ys, probas = [], []
+    for batch in loader:
+        batch = batch.to(device)
+        logits = model(batch)
+        proba = torch.softmax(logits, dim=-1).cpu().numpy()
+        probas.append(proba); ys.append(batch.y.cpu().numpy())
+    y = np.concatenate(ys); P = np.vstack(probas)
+    return y, P
+
+def plot_multiclass_macro_roc(y_true, y_proba, n_classes, out_path="roc_macro.png", title="ROC (macro)"):
+    from sklearn.metrics import roc_curve, auc
+    import numpy as np, matplotlib.pyplot as plt
+    # one-vs-rest binarization
+    Y = np.zeros((y_true.shape[0], n_classes), dtype=float)
+    Y[np.arange(y_true.shape[0]), y_true] = 1.0
+    fpr = []; tpr = []
+    for c in range(n_classes):
+        fpc, tpc, _ = roc_curve(Y[:, c], y_proba[:, c])
+        fpr.append(fpc); tpr.append(tpc)
+    # macro-average ROC
+    all_fpr = np.unique(np.concatenate(fpr))
+    mean_tpr = np.zeros_like(all_fpr)
+    for c in range(n_classes):
+        mean_tpr += np.interp(all_fpr, fpr[c], tpr[c])
+    mean_tpr /= n_classes
+    macro_auc = auc(all_fpr, mean_tpr)
+    # plot
+    plt.figure(figsize=(6,5))
+    plt.plot(all_fpr, mean_tpr, label=f"macro-average ROC (AUC={macro_auc:.3f})")
+    plt.plot([0,1],[0,1],'--')
+    plt.xlabel("False Positive Rate"); plt.ylabel("True Positive Rate")
+    plt.title(title); plt.legend(); plt.tight_layout()
+    plt.savefig(out_path, dpi=150); plt.close()
+    return macro_auc
+
+
+# --- Reload Best Model ---
+def load_best(model, ckpt_path, device):
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(ckpt["model"])
+    model.to(device).eval()
+    print(f"Loaded {ckpt_path} (epoch={ckpt.get('epoch')}, val_loss={ckpt.get('val_loss')})")
+    return model
+
 
 # ---------------- Dataset ----------------
 class ExpressionGraphDataset(torch.utils.data.Dataset):
@@ -365,7 +416,8 @@ class History:
 
 def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, weight_decay=1e-4,
                  log_csv="training_log.csv", plot_png="training_curves.png", log_every=10,
-                 class_weights=None, use_amp=False):
+                 class_weights=None, use_amp=False,
+                 ckpt_best="best_val_loss.pt", ckpt_last="last.pt"):
     amp_enabled = (device.type == "cuda") and use_amp
     crit  = nn.CrossEntropyLoss(weight=(class_weights.to(device) if class_weights is not None else None))
     opt   = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -380,6 +432,8 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
         torch.backends.cudnn.benchmark = True
 
     print(f"Device: {device}, torch.cuda.is_available()={torch.cuda.is_available()}")
+
+    best_val = float("inf")
 
     for epoch in range(1, epochs+1):
         model.train()
@@ -403,8 +457,7 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
 
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            scaler.step(opt); scaler.update()
             if use_cuda: torch.cuda.synchronize()
             t3 = perf_counter()
 
@@ -438,17 +491,31 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
         train_loss = total / len(train_loader.dataset)
         val_loss   = vloss / max(1, len(val_loader.dataset))
         val_acc    = correct / max(1, total_g)
-        epoch_time = perf_counter() - t0_epoch
 
-        # step the scheduler on validation loss
+        # step the scheduler and read LR
         sched.step(val_loss)
         curr_lr = opt.param_groups[0]["lr"]
 
+        epoch_time = perf_counter() - t0_epoch
         print(f"Epoch {epoch:03d} | {epoch_time:.1f}s | lr={curr_lr:.2e} | "
               f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | val_acc={val_acc:.3f}")
 
+        # save best-by-val-loss
+        if val_loss < best_val - 1e-6:
+            best_val = val_loss
+            torch.save({"model": model.state_dict(),
+                        "opt": opt.state_dict(),
+                        "epoch": epoch,
+                        "val_loss": val_loss}, ckpt_best)
+
         hist.epoch.append(epoch); hist.train_loss.append(train_loss)
         hist.val_loss.append(val_loss); hist.val_acc.append(val_acc)
+
+    # save "last" checkpoint
+    torch.save({"model": model.state_dict(),
+                "opt": opt.state_dict(),
+                "epoch": epochs,
+                "val_loss": hist.val_loss[-1] if hist.val_loss else None}, ckpt_last)
 
     # save CSV + plot
     df = pd.DataFrame({"epoch": hist.epoch, "train_loss": hist.train_loss,
@@ -459,6 +526,7 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
     plt.plot(hist.epoch, hist.val_loss, label="Val Loss")
     plt.xlabel("Epoch"); plt.ylabel("Loss"); plt.legend(); plt.title("Training/Validation Loss")
     plt.savefig(plot_png, bbox_inches="tight", dpi=150); plt.close()
+    print(f"Saved checkpoints → {ckpt_best}, {ckpt_last}")
     print(f"Saved training log to {log_csv} and loss curves to {plot_png}")
     return hist
 
@@ -544,6 +612,18 @@ if __name__ == "__main__":
     print(f"Test acc={stats['acc']:.3f}, macro-F1={stats['macro_f1']:.3f}")
     print(stats["report"])
     plot_confusion_matrix(stats["cm"], out_path="confusion_matrix.png", title="Confusion Matrix")
+
+    # Validation ROC-AUC (macro)
+    y_val, P_val = collect_probs(val_loader, model, device)
+    val_macro_auc = plot_multiclass_macro_roc(y_val, P_val, num_classes,
+                                            out_path="roc_val_macro.png", title="Validation ROC (macro)")
+    print(f"Validation macro AUC: {val_macro_auc:.3f}")
+
+    # Test ROC-AUC (macro)
+    y_test, P_test = collect_probs(test_loader, model, device)
+    test_macro_auc = plot_multiclass_macro_roc(y_test, P_test, num_classes,
+                                            out_path="roc_test_macro.png", title="Test ROC (macro)")
+    print(f"Test macro AUC: {test_macro_auc:.3f}")
 
     node_emb_after, edge_emb_after, graph_emb_after = get_single_graph_embeddings(ds, idx_vis, model, device)
     print(f"[Embeddings AFTER] node={node_emb_after.shape}, edge={edge_emb_after.shape}, graph={graph_emb_after.shape}")
