@@ -241,6 +241,49 @@ def plot_multiclass_macro_roc(y_true, y_proba, n_classes, out_path="roc_macro.pn
     plt.savefig(out_path, dpi=150); plt.close()
     return macro_auc
 
+def auc_diagnostics(y_true, y_proba, n_classes):
+    from sklearn.metrics import roc_curve, auc
+    import numpy as np
+
+    Y = np.zeros((y_true.shape[0], n_classes), float)
+    Y[np.arange(y_true.shape[0]), y_true] = 1.0
+
+    per_auc = []
+    fprs, tprs = [], []
+    valid = []
+    for c in range(n_classes):
+        y_c = Y[:, c]
+        # skip impossible ROC (no positives or all positives)
+        if y_c.sum() == 0 or y_c.sum() == y_c.shape[0]:
+            continue
+        fpc, tpc, _ = roc_curve(y_c, y_proba[:, c])
+        per_auc.append(auc(fpc, tpc))
+        fprs.append(fpc); tprs.append(tpc); valid.append(c)
+
+    # macro-mean of per-class AUCs
+    macro_mean_auc = float(np.mean(per_auc)) if per_auc else float("nan")
+
+    # macro-average ROC curve AUC (matches your plot function)
+    all_fpr = np.unique(np.concatenate(fprs))
+    mean_tpr = np.zeros_like(all_fpr)
+    for fpc, tpc in zip(fprs, tprs):
+        mean_tpr += np.interp(all_fpr, fpc, tpc)
+    mean_tpr /= len(fprs)
+    macro_curve_auc = auc(all_fpr, mean_tpr)
+
+    # micro-average AUC (frequency-weighted)
+    fpr_micro, tpr_micro, _ = roc_curve(Y.ravel(), y_proba.ravel())
+    micro_auc = auc(fpr_micro, tpr_micro)
+
+    return {
+        "macro_curve_auc": macro_curve_auc,
+        "macro_mean_auc": macro_mean_auc,
+        "micro_auc": micro_auc,
+        "per_class_auc": np.array(per_auc),
+        "valid_classes": np.array(valid)
+    }
+
+
 
 # --- Reload Best Model ---
 def load_best(model, ckpt_path, device):
@@ -618,12 +661,25 @@ if __name__ == "__main__":
     val_macro_auc = plot_multiclass_macro_roc(y_val, P_val, num_classes,
                                             out_path="roc_val_macro.png", title="Validation ROC (macro)")
     print(f"Validation macro AUC: {val_macro_auc:.3f}")
+    diag = auc_diagnostics(y_val, P_val, num_classes)
+    print(f"Validation AUCs → macro-curve:{diag['macro_curve_auc']:.3f} | "
+          f"macro-mean:{diag['macro_mean_auc']:.3f} | micro:{diag['micro_auc']:.3f}")
+    print(f"Per-class AUC: mean={diag['per_class_auc'].mean():.3f}, "
+          f"min={diag['per_class_auc'].min():.3f}, max={diag['per_class_auc'].max():.3f}, "
+          f"n_valid={len(diag['per_class_auc'])}")
 
     # Test ROC-AUC (macro)
     y_test, P_test = collect_probs(test_loader, model, device)
     test_macro_auc = plot_multiclass_macro_roc(y_test, P_test, num_classes,
                                             out_path="roc_test_macro.png", title="Test ROC (macro)")
+    diag = auc_diagnostics(y_test, P_test, num_classes)
     print(f"Test macro AUC: {test_macro_auc:.3f}")
+    print(f"Test AUCs → macro-curve:{diag['macro_curve_auc']:.3f} | "
+      f"macro-mean:{diag['macro_mean_auc']:.3f} | micro:{diag['micro_auc']:.3f}")
+    print(f"Per-class AUC: mean={diag['per_class_auc'].mean():.3f}, "
+      f"min={diag['per_class_auc'].min():.3f}, max={diag['per_class_auc'].max():.3f}, "
+      f"n_valid={len(diag['per_class_auc'])}")
+
 
     node_emb_after, edge_emb_after, graph_emb_after = get_single_graph_embeddings(ds, idx_vis, model, device)
     print(f"[Embeddings AFTER] node={node_emb_after.shape}, edge={edge_emb_after.shape}, graph={graph_emb_after.shape}")
