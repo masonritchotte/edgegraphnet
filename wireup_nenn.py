@@ -533,9 +533,9 @@ def run_training(train_loader, val_loader, model, device, epochs=30, lr=1e-3, we
 # -------------- Main ---------------------
 if __name__ == "__main__":
     # EDIT THESE PATHS:
-    adj_file_path = '/home/mzr19001/edge graph net/data/embedding.npy'
-    expression_csv = '/home/mzr19001/edge graph net/data/tcga/top500_expression_data.csv'
-    labels_csv     = '/home/mzr19001/edge graph net/data/tcga/tcga_labels.csv'   # with column `icluster_cluster_assignment`
+    adj_file_path = '/home/mzr19001/edgegraphnet/data/embedding.npy'
+    expression_csv = '/home/mzr19001/edgegraphnet/data/tcga/top500_expression_data.csv'
+    labels_csv     = '/home/mzr19001/edgegraphnet/data/tcga/tcga_labels.csv'   # with column `icluster_cluster_assignment`
 
     # Load files (pandas/numpy as-is)
     adj_np   = np.load(adj_file_path, allow_pickle=True)
@@ -606,7 +606,7 @@ if __name__ == "__main__":
 
     hist = run_training(train_loader, val_loader, model, device,
                         epochs=200, lr=1e-3, weight_decay=1e-4,
-                        class_weights=train_weights, use_amp=True)
+                        class_weights=train_weights, use_amp=False) # SETTING USE AMP TO FALSE
 
     stats = eval_on_loader(test_loader, model, device)
     print(f"Test acc={stats['acc']:.3f}, macro-F1={stats['macro_f1']:.3f}")
